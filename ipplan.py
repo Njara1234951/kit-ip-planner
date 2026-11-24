@@ -1,111 +1,261 @@
-"""Kit IP Planner 2.0: projet JSON, rapport PDF et schéma réseau SVG."""
+"""Moteur de calcul du plan d'adressage IP d'un kit d'installation.
+
+Aucune dépendance externe : uniquement la bibliothèque standard Python.
+Utilisé par l'interface (main.py) et par les tests.
+"""
 from __future__ import annotations
-import json
-from pathlib import Path
-from xml.sax.saxutils import escape
+
+import csv
 import ipaddress
+import math
+from dataclasses import dataclass, field
 
-from advanced import validate_vlans
 
-DEFAULT_VLANS = [
-    {"id": 10, "name": "Administration", "subnet": "192.168.10.0/24", "purpose": "Routeur, switchs, NVR"},
-    {"id": 20, "name": "CCTV", "subnet": "192.168.20.0/24", "purpose": "Caméras IP"},
-    {"id": 30, "name": "Wi-Fi", "subnet": "192.168.30.0/24", "purpose": "Bornes et clients Wi-Fi"},
-    {"id": 40, "name": "Accès", "subnet": "192.168.40.0/24", "purpose": "Interphones et contrôle d'accès"},
+@dataclass(frozen=True)
+class DeviceType:
+    key: str
+    label: str
+    prefix: str
+    classic_start: int      # première adresse du bloc dans un réseau « classique »
+    poe_watts: float = 0.0  # consommation PoE moyenne par équipement
+
+
+# L'ordre ici est l'ordre d'attribution des adresses.
+DEVICE_TYPES: list[DeviceType] = [
+    DeviceType("gateway", "Routeur / Passerelle", "GW", 1),
+    DeviceType("switch", "Switch", "SW", 2),
+    DeviceType("nvr", "Enregistreur NVR/DVR", "NVR", 10),
+    DeviceType("ap", "Borne Wi-Fi", "AP", 20, 15.0),
+    DeviceType("intercom", "Interphone / Contrôle d'accès", "ACC", 30, 8.0),
+    DeviceType("printer", "Imprimante", "PRN", 40),
+    DeviceType("other", "Autre équipement", "DEV", 50),
+    DeviceType("camera", "Caméra IP", "CAM", 100, 8.0),
 ]
+TYPES_BY_KEY = {t.key: t for t in DEVICE_TYPES}
+
+# Équipements qui occupent un port de switch (tout sauf la passerelle et les switchs eux-mêmes).
+_PORT_KEYS = [t.key for t in DEVICE_TYPES if t.key not in ("gateway", "switch")]
 
 
-def save_project(path, project):
-    if not isinstance(project, dict):
-        raise ValueError("Le projet doit être un objet JSON.")
-    project = dict(project)
-    project["vlans"] = validate_vlans(project.get("vlans", DEFAULT_VLANS))
-    project["format"] = "kit-ip-planner-project"
-    project["version"] = 3
-    Path(path).write_text(json.dumps(project, ensure_ascii=False, indent=2), encoding="utf-8")
+@dataclass
+class Row:
+    name: str
+    type_label: str
+    ip: str
+    netmask: str
+    gateway: str
 
 
-def load_project(path):
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("format") != "kit-ip-planner-project" or data.get("version") not in (1, 2, 3):
-        raise ValueError("Ce fichier n'est pas un projet Kit IP Planner reconnu.")
-    data["vlans"] = validate_vlans(data.get("vlans", DEFAULT_VLANS))
-    data["version"] = 3
-    settings = data.get("settings", {})
-    if not isinstance(settings, dict):
-        raise ValueError("Les paramètres du projet sont invalides.")
-    project = data.get("project", {})
-    if not isinstance(project, dict):
-        raise ValueError("Les informations du projet sont invalides.")
-    return data
+@dataclass
+class Plan:
+    network: ipaddress.IPv4Network
+    gateway: str
+    rows: list[Row]
+    layout: str                      # « classique » ou « compact »
+    stats: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+    def summary_text(self) -> str:
+        s = self.stats
+        lines = [
+            f"Réseau : {self.network}   Masque : {self.network.netmask}",
+            f"Passerelle : {self.gateway}   Broadcast : {self.network.broadcast_address}",
+            f"Adresses utilisées : {s['used']} / {s['hosts']} ({s['usage_pct']:.0f} %)   "
+            f"Disposition : {self.layout}",
+        ]
+        if s["ports_needed"]:
+            lines.append(
+                f"Ports switch nécessaires : {s['ports_needed']}   "
+                f"Switchs de {s['ports_per_switch']} ports recommandés : {s['switches_recommended']}"
+            )
+        if s["poe_watts"]:
+            lines.append(f"Puissance PoE estimée : {s['poe_watts']:.0f} W (avec marge 25 % : {s['poe_with_margin_w']:.0f} W, moyenne estimée par switch : {s['poe_per_switch_w']:.0f} W)")
+        if s["cameras"]:
+            lines.append(
+                f"Débit caméras : {s['bandwidth_mbps']:.0f} Mb/s   "
+                f"Stockage : {s['storage_gb_day']:.0f} Go/jour, "
+                f"{s['storage_tb']:.1f} To brut / {s['storage_tb_recommended']:.1f} To conseillé (+20 %) pour {s['retention_days']} jours (continu)"
+            )
+        for w in self.warnings:
+            lines.append(f"⚠ {w}")
+        return "\n".join(lines)
 
 
-def generate_svg(plan, project_name="Projet réseau"):
-    rows = plan.rows
-    width, height = 1000, max(480, 150 + len(rows) * 28)
-    # Diagramme conceptuel, sans prétendre représenter le câblage exact.
-    boxes = [("Routeur / Passerelle", plan.gateway, 50, 40, 220, 80),
-             ("Switch(s)", f"{plan.stats.get('switches_recommended', 0)} recommandé(s)", 390, 40, 220, 80),
-             ("NVR", next((r.ip for r in rows if r.type_label.startswith("Enregistreur")), "Non prévu"), 730, 40, 220, 80)]
-    cam_rows = [r for r in rows if r.type_label == "Caméra IP"]
-    ap_rows = [r for r in rows if r.type_label == "Borne Wi-Fi"]
-    other_rows = [r for r in rows if r.type_label not in ("Caméra IP", "Borne Wi-Fi", "Routeur / Passerelle", "Switch", "Enregistreur NVR/DVR")]
-    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-             '<rect width="100%" height="100%" fill="#f8fafc"/>',
-             f'<text x="30" y="25" font-family="Arial" font-size="20" font-weight="bold" fill="#0f172a">{escape(project_name)}</text>']
-    for label, detail, x, y, w, h in boxes:
-        parts += [f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="12" fill="#e0f2fe" stroke="#0284c7" stroke-width="2"/>',
-                  f'<text x="{x+w/2}" y="{y+30}" text-anchor="middle" font-family="Arial" font-size="16" font-weight="bold">{escape(label)}</text>',
-                  f'<text x="{x+w/2}" y="{y+55}" text-anchor="middle" font-family="Arial" font-size="13">{escape(detail)}</text>']
-    parts.append('<path d="M270 80 H390 M610 80 H730" stroke="#475569" stroke-width="3"/>')
-    groups = [("Caméras", cam_rows), ("Bornes Wi-Fi", ap_rows), ("Autres équipements", other_rows)]
-    y = 170
-    for title, group in groups:
-        if not group: continue
-        parts.append(f'<text x="40" y="{y}" font-family="Arial" font-size="16" font-weight="bold" fill="#334155">{escape(title)} ({len(group)})</text>')
-        y += 18
-        for i, row in enumerate(group):
-            x = 40 + (i % 4) * 230
-            yy = y + (i // 4) * 65
-            parts += [f'<rect x="{x}" y="{yy}" width="205" height="48" rx="8" fill="#fff" stroke="#94a3b8"/>',
-                      f'<text x="{x+10}" y="{yy+19}" font-family="Arial" font-size="13" font-weight="bold">{escape(row.name)}</text>',
-                      f'<text x="{x+10}" y="{yy+36}" font-family="Arial" font-size="12">{escape(row.ip)}</text>']
-        y += ((len(group)+3)//4)*65 + 25
-    parts.append('</svg>')
-    return "\n".join(parts)
-
-
-def export_pdf(plan, path, project_name="Projet réseau", client="", site="", vlans=None, vlan_assignments=None):
+def parse_network(text: str) -> ipaddress.IPv4Network:
+    text = (text or "").strip()
+    if "/" not in text:
+        raise ValueError("Ajoute le masque au réseau, par exemple 192.168.1.0/24.")
     try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import mm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-    except ImportError as exc:
-        raise RuntimeError("Pour exporter en PDF, installe reportlab : pip install reportlab") from exc
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=8, leading=10))
-    doc = SimpleDocTemplate(str(path), pagesize=landscape(A4), rightMargin=15*mm, leftMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
-    story = [Paragraph("KIT IP PLANNER — RAPPORT D'INSTALLATION", styles["Title"]),
-             Paragraph(f"Projet : {escape(str(project_name))} | Client : {escape(str(client or '—'))} | Site : {escape(str(site or '—'))}", styles["Normal"]), Spacer(1, 8)]
-    story += [Paragraph("Résumé réseau", styles["Heading2"]), Paragraph(escape(plan.summary_text()).replace("\n", "<br/>"), styles["Normal"]), Spacer(1, 8)]
-    data = [["Nom", "Type", "Adresse IP", "Masque", "Passerelle"]] + [[r.name, r.type_label, r.ip, r.netmask, r.gateway] for r in plan.rows]
-    table = Table(data, repeatRows=1, colWidths=[35*mm, 55*mm, 35*mm, 35*mm, 35*mm])
-    table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f4c81")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 8), ("GRID", (0,0), (-1,-1), .35, colors.grey), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#eef5fb")]), ("VALIGN", (0,0), (-1,-1), "MIDDLE")]))
-    story += [Paragraph("Plan d'adressage", styles["Heading2"]), table, Spacer(1, 10)]
-    story += [Paragraph("Plan VLAN (à adapter à l'équipement)", styles["Heading2"])]
-    validated_vlans = validate_vlans(vlans or DEFAULT_VLANS)
-    vlan_data = [["ID", "Nom", "Sous-réseau", "Usage"]] + [[str(v.get("id", "")), v.get("name", ""), v.get("subnet", ""), v.get("purpose", "")] for v in validated_vlans]
-    vt = Table(vlan_data, colWidths=[18*mm, 40*mm, 45*mm, 95*mm])
-    vt.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#166534")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .35, colors.grey), ("FONTSIZE", (0,0), (-1,-1), 8)]))
-    story.append(vt)
-    if vlan_assignments:
-        story += [Spacer(1, 8), Paragraph("Adressage IP par VLAN", styles["Heading2"])]
-        assignment_data = [["Équipement", "VLAN", "Sous-réseau", "IP", "Passerelle"]]
-        assignment_data += [[a.device, f"{a.vlan_id} - {a.vlan_name}", a.subnet, a.ip, a.gateway] for a in vlan_assignments]
-        at = Table(assignment_data, repeatRows=1, colWidths=[35*mm, 40*mm, 40*mm, 35*mm, 35*mm])
-        at.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#334155")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .35, colors.grey), ("FONTSIZE", (0,0), (-1,-1), 7), ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#eef5fb")])]))
-        story.append(at)
-    story += [Spacer(1, 8), Paragraph("Notes : estimations PoE et stockage à confirmer avec les fiches techniques. Prévoir une marge de capacité, vérifier les VLAN, les règles de pare-feu et la configuration réelle avant mise en service.", styles["Small"])]
-    doc.build(story)
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError as exc:
+        raise ValueError(f"Réseau invalide : « {text} ». Exemple : 192.168.1.0/24.") from exc
+    if net.version != 4:
+        raise ValueError("Seul l'IPv4 est géré.")
+    if net.prefixlen > 30:
+        raise ValueError("Le masque doit être /30 ou plus large (par exemple /24).")
+    return net
+
+
+def suggest_prefix(devices: int, spare: float = 0.25) -> int:
+    """Plus petit préfixe pouvant contenir `devices` équipements + une marge."""
+    needed = math.ceil(devices * (1 + spare))
+    for prefix in range(30, 7, -1):
+        if 2 ** (32 - prefix) - 2 >= needed:
+            return prefix
+    return 8
+
+
+def _classic_layout(blocks, host_count: int, gateway_last: bool):
+    starts = {}
+    for t, n in blocks:
+        starts[t.key] = host_count if (t.key == "gateway" and gateway_last) else t.classic_start
+    prev_end = 0
+    for start, end in sorted((starts[t.key], starts[t.key] + n - 1) for t, n in blocks):
+        if start <= prev_end or end > host_count:
+            return None
+        prev_end = end
+    return starts
+
+
+def _compact_layout(blocks, host_count: int, gateway_last: bool):
+    starts, cursor = {}, 1
+    for t, n in blocks:
+        if t.key == "gateway" and gateway_last:
+            starts[t.key] = host_count
+            continue
+        starts[t.key] = cursor
+        cursor += n
+    return starts
+
+
+def build_plan(
+    network: str,
+    counts: dict[str, int],
+    gateway_last: bool = False,
+    ports_per_switch: int = 24,
+    bitrate_mbps: float = 4.0,
+    retention_days: int = 30,
+    poe_budget_w: float = 0.0,
+) -> Plan:
+    net = parse_network(network)
+    host_count = net.num_addresses - 2
+
+    clean: dict[str, int] = {}
+    for key, value in counts.items():
+        if key not in TYPES_BY_KEY or key == "gateway":
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"La quantité pour « {TYPES_BY_KEY[key].label} » doit être un entier.") from exc
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"La quantité pour « {TYPES_BY_KEY[key].label} » doit être un entier.")
+        if number < 0:
+            raise ValueError("Les quantités ne peuvent pas être négatives.")
+        clean[key] = number
+    if isinstance(ports_per_switch, bool) or not isinstance(ports_per_switch, int) or ports_per_switch < 2:
+        raise ValueError("Un switch doit avoir au moins 2 ports (valeur entière).")
+    try:
+        bitrate_mbps = float(bitrate_mbps)
+        poe_budget_w = float(poe_budget_w)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Débit et budget PoE doivent être des nombres valides.") from exc
+    if not all(math.isfinite(v) for v in (bitrate_mbps, poe_budget_w)):
+        raise ValueError("Débit et budget PoE doivent être des nombres valides (pas NaN ou infini).")
+    if bitrate_mbps < 0 or retention_days < 0 or poe_budget_w < 0:
+        raise ValueError("Débit, durée et budget PoE ne peuvent pas être négatifs.")
+    if isinstance(retention_days, bool) or not isinstance(retention_days, int):
+        raise ValueError("La durée de rétention doit être un nombre entier de jours.")
+
+    clean["gateway"] = 1
+    blocks = [(t, clean.get(t.key, 0)) for t in DEVICE_TYPES if clean.get(t.key, 0) > 0]
+    total = sum(n for _, n in blocks)
+
+    if total > host_count:
+        raise ValueError(
+            f"{total} équipements pour seulement {host_count} adresses dans {net}. "
+            f"Utilise au moins un /{suggest_prefix(total)}."
+        )
+
+    starts = _classic_layout(blocks, host_count, gateway_last)
+    layout = "classique"
+    if starts is None:
+        starts = _compact_layout(blocks, host_count, gateway_last)
+        layout = "compact"
+
+    rows: list[Row] = []
+    gateway_ip = str(net.network_address + starts["gateway"])
+    netmask = str(net.netmask)
+    for t, n in blocks:
+        for i in range(n):
+            ip = str(net.network_address + starts[t.key] + i)
+            name = t.prefix if t.key == "gateway" else f"{t.prefix}-{i + 1:02d}"
+            rows.append(Row(name, t.label, ip, netmask, gateway_ip))
+
+    # --- Statistiques et avertissements -----------------------------------
+    warnings: list[str] = []
+    usage_pct = total / host_count * 100
+    if usage_pct >= 80:
+        warnings.append(
+            f"Réseau rempli à {usage_pct:.0f} %. Prévois plutôt un /{suggest_prefix(total)}."
+        )
+    if not net.is_private:
+        warnings.append("Réseau en adresses publiques : préfère 192.168.x.x, 10.x.x.x ou 172.16-31.x.x.")
+
+    ports_needed = sum(clean.get(k, 0) for k in _PORT_KEYS)
+    switches_have = clean.get("switch", 0)
+    switches_recommended = 0
+    if ports_needed:
+        n = 1
+        while True:
+            usable = n * ports_per_switch - (2 * (n - 1) if n > 1 else 0) - 1  # liaisons montantes
+            if usable >= ports_needed:
+                break
+            n += 1
+        switches_recommended = n
+        if switches_have < switches_recommended:
+            warnings.append(
+                f"{switches_have} switch(s) prévu(s) mais {switches_recommended} nécessaire(s) "
+                f"({ports_needed} ports + liaisons montantes, switchs de {ports_per_switch} ports)."
+            )
+
+    poe_watts = sum(TYPES_BY_KEY[k].poe_watts * clean.get(k, 0) for k in TYPES_BY_KEY)
+    if poe_budget_w and poe_watts * 1.25 > poe_budget_w:
+        warnings.append(
+            f"PoE : consommation estimée {poe_watts:.0f} W, avec marge 25 % {poe_watts * 1.25:.0f} W, supérieure au budget saisi ({poe_budget_w:.0f} W)."
+        )
+
+    cameras = clean.get("camera", 0)
+    bandwidth = cameras * bitrate_mbps
+    storage_gb_day = bandwidth * 10.8          # 1 Mb/s = 10,8 Go par jour
+    storage_tb = storage_gb_day * retention_days / 1000
+    storage_tb_recommended = storage_tb * 1.20  # marge 20 % pour variations et réserve
+    if cameras and bitrate_mbps == 0:
+        warnings.append("Débit par caméra nul : l'estimation de bande passante et de stockage est nulle.")
+    if cameras and not clean.get("nvr", 0):
+        warnings.append("Aucun enregistreur : les caméras n'auront pas de stockage centralisé.")
+    if bandwidth > 800:
+        warnings.append(f"Débit caméras de {bandwidth:.0f} Mb/s : une liaison gigabit sera saturée.")
+
+    stats = {
+        "hosts": host_count, "used": total, "usage_pct": usage_pct, "cameras": cameras,
+        "ports_needed": ports_needed, "ports_per_switch": ports_per_switch,
+        "switches_recommended": switches_recommended, "poe_watts": poe_watts,
+        "bandwidth_mbps": bandwidth, "storage_gb_day": storage_gb_day,
+        "storage_tb": storage_tb, "storage_tb_recommended": storage_tb_recommended, "retention_days": retention_days,
+        "poe_with_margin_w": poe_watts * 1.25,
+        "poe_per_switch_w": poe_watts / max(switches_have or switches_recommended or 1, 1),
+    }
+    return Plan(net, gateway_ip, rows, layout, stats, warnings)
+
+
+CSV_HEADER = ["Nom", "Type", "Adresse IP", "Masque", "Passerelle", "Adresse MAC", "Emplacement", "Notes"]
+
+
+def export_csv(plan: Plan, path: str) -> None:
+    """CSV avec point-virgule et BOM UTF-8 : s'ouvre directement dans Excel en français."""
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(CSV_HEADER)
+        for r in plan.rows:
+            writer.writerow([r.name, r.type_label, r.ip, r.netmask, r.gateway, "", "", ""])
